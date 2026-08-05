@@ -1,0 +1,82 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: taskqueue
+      POSTGRES_USER: taskuser
+      POSTGRES_PASSWORD: taskpass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations/001_create_jobs.sql:/docker-entrypoint-initdb.d/001_create_jobs.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskuser -d taskqueue"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  api:
+    build: ./services/api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://taskuser:taskpass@postgres:5432/taskqueue
+      REDIS_URL: redis://redis:6379
+    volumes:
+      - ./shared:/app/shared
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: ./services/worker
+    environment:
+      DATABASE_URL: postgresql://taskuser:taskpass@postgres:5432/taskqueue
+      REDIS_URL: redis://redis:6379
+    volumes:
+      - ./shared:/app/shared
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 2  # Run 2 workers to demonstrate horizontal scaling
+
+  scheduler:
+    build: ./services/scheduler
+    environment:
+      DATABASE_URL: postgresql://taskuser:taskpass@postgres:5432/taskqueue
+      REDIS_URL: redis://redis:6379
+      SCHEDULER_INTERVAL_SECONDS: 30
+      STALE_TIMEOUT_MINUTES: 5
+    volumes:
+      - ./shared:/app/shared
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  monitor:
+    build: ./services/monitor
+    ports:
+      - "8001:8001"
+    environment:
+      DATABASE_URL: postgresql://taskuser:taskpass@postgres:5432/taskqueue
+      REDIS_URL: redis://redis:6379
+    volumes:
+      - ./shared:/app/shared
+    depends_on:
+      - postgres
+      - redis
+
+volumes:
+  postgres_data:

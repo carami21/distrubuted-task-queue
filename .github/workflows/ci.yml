@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: taskqueue
+          POSTGRES_USER: taskuser
+          POSTGRES_PASSWORD: taskpass
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-retries 10
+        ports:
+          - 6379:6379
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          pip install fastapi uvicorn psycopg2-binary redis pydantic \
+                      pytest pytest-cov httpx flake8
+      - name: Run migrations
+        env:
+          PGPASSWORD: taskpass
+        run: psql -h localhost -U taskuser -d taskqueue -f migrations/001_create_jobs.sql
+      - name: Lint
+        run: python -m flake8 shared/ services/ tests/ --max-line-length=100 || true
+      - name: Run tests
+        env:
+          DATABASE_URL: postgresql://taskuser:taskpass@localhost:5432/taskqueue
+          REDIS_URL: redis://localhost:6379
+        run: pytest tests/ --cov=shared --cov-report=term-missing --cov-fail-under=85
