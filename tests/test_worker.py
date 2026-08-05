@@ -21,6 +21,13 @@ def fake_pubsub(messages):
     return pubsub
 
 
+@pytest.fixture(autouse=True)
+def no_pending_jobs_on_startup():
+    """run() does a catch-up scan for stranded pending jobs before the pubsub loop."""
+    with patch("worker.list_jobs", return_value=[]):
+        yield
+
+
 def test_claim_job_called_with_correct_job_id_and_version():
     job = dict(BASE_JOB)
     messages = [{"type": "message", "data": "job-1"}]
@@ -117,3 +124,28 @@ def test_process_job_generate_report_returns_expected_shape():
 def test_process_job_unknown_type_raises():
     with pytest.raises(ValueError):
         process_job("unknown_type", {})
+
+
+def test_catch_up_claims_stranded_pending_jobs_before_listening():
+    stranded = {**BASE_JOB, "job_id": "job-stranded"}
+    messages = []  # nothing arrives over pubsub in this test
+
+    with patch("worker.list_jobs", return_value=[stranded]), \
+         patch("worker.subscribe_jobs", return_value=fake_pubsub(messages)), \
+         patch("worker.get_job", return_value=stranded), \
+         patch("worker.claim_job", return_value=True) as mock_claim, \
+         patch("worker.process_job", return_value={"ok": True}), \
+         patch("worker.complete_job") as mock_complete:
+        worker.run()
+
+    mock_claim.assert_called_once_with("job-stranded", 0)
+    mock_complete.assert_called_once()
+
+
+def test_catch_up_does_nothing_when_no_pending_jobs():
+    with patch("worker.list_jobs", return_value=[]), \
+         patch("worker.subscribe_jobs", return_value=fake_pubsub([])), \
+         patch("worker.claim_job") as mock_claim:
+        worker.run()
+
+    mock_claim.assert_not_called()

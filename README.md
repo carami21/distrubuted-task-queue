@@ -104,8 +104,15 @@ succeeds for exactly one concurrent caller; every loser sees `0` rows affected a
 ## Fault Tolerance
 
 If a worker crashes mid-job, the job is left in `running` with a stale `started_at`. The
-scheduler polls every 30s for jobs `running` longer than 5 minutes and requeues them to
-`pending` (or `dead` if retries are exhausted), so no job is lost to a worker crash.
+scheduler polls every 30s for jobs `running` longer than 5 minutes and requeues them back to
+`pending` (or `dead` if retries are exhausted).
+
+Requeuing alone isn't enough, though: Redis pub/sub only delivers to clients that are actively
+subscribed at publish time, so a job requeued while no worker happens to be listening would sit
+`pending` forever with nothing to claim it. To close that gap, every worker runs a catch-up scan
+for pending jobs on startup, before it ever blocks on the pubsub loop — so a job is always picked
+up either by the next live broadcast or by the next worker that comes online. This was found and
+fixed during the live crash test described below.
 
 ## Testing
 
@@ -113,9 +120,44 @@ scheduler polls every 30s for jobs `running` longer than 5 minutes and requeues 
 make test   # pytest tests/ --cov=shared --cov-report=term-missing -v
 ```
 
-40 unit tests covering the API, worker claim/process/fail logic, scheduler requeue logic, and
-the database/Redis layers, with 98%+ coverage on `shared/`. Enforced via GitHub Actions on every
-push to `main`.
+42 unit tests covering the API, worker claim/process/fail/catch-up logic, scheduler requeue
+logic, and the database/Redis layers, with 99% coverage on `shared/`. Enforced via GitHub
+Actions on every push to `main`.
+
+## Verified
+
+Beyond the unit test suite (mocked, no live infra needed), the full system has been run and
+exercised end-to-end against real Postgres/Redis/Docker containers:
+
+- **`docker compose up --build`** — all 6 containers (`postgres`, `redis`, `api`, `worker` x2,
+  `scheduler`, `monitor`) started clean, `postgres`/`redis` reporting `healthy`.
+- **`GET /health`** — returned `{"api":"ok","redis":"ok","postgres":"ok"}`, HTTP 200.
+- **Job lifecycle** — `POST /jobs` → job observed transitioning `pending` → `running` → `done`
+  end to end in ~26ms via `GET /jobs/{id}`, `result` populated by the worker.
+- **`GET /jobs`, `GET /stats`** — both confirmed returning correct live data from Postgres.
+- **Horizontal scaling / no duplicate processing** — scaled to 3 workers (`make scale-workers`),
+  fired 20 concurrent `POST /jobs` requests. Result: 21/21 jobs (20 new + 1 prior) reached `done`
+  with `attempts == 1` each, zero duplicates. Worker logs show every job broadcast to all 3
+  workers, with the losers explicitly logging `already claimed by another worker, skipping` —
+  the optimistic-lock race resolving correctly under real concurrent load.
+- **Worker crash + scheduler requeue** — submitted a `resize_image` job, killed the claiming
+  worker container (`docker kill`, exit code 137) ~80ms into its 200ms simulated processing time
+  to leave the job stuck in `running`. The scheduler detected it as stale within its poll
+  interval and requeued it:
+  ```
+  [SCHEDULER] Found 1 stale jobs, requeuing...
+  [SCHEDULER] Requeueing job 95945397-... (attempts=1)
+  ```
+  This surfaced the pub/sub delivery gap described above (job then sat `pending` with no
+  subscriber to claim it). After adding the worker's startup catch-up scan and rebuilding the
+  image, restarting a worker picked the stranded job up immediately and completed it:
+  ```
+  [WORKER] Catch-up: found 1 pending job(s) on startup
+  [WORKER] Processing job 95945397-... (type=resize_image)
+  [WORKER] Job 95945397-... completed: {'output_path': '/processed/crashtest.png', 'size': '800x600'}
+  ```
+  Final job record: `status: done`, `attempts: 2`, `error` field still shows the original
+  timeout message as history of the crash-and-recover cycle.
 
 ## Stack
 
